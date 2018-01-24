@@ -2,6 +2,7 @@ import { Subject } from 'rxjs/Subject';
 import { map } from 'rxjs/operator/map';
 import { switchMap } from 'rxjs/operator/switchMap';
 import { ActionsObservable } from './ActionsObservable';
+import { StateSubject } from './StateSubject';
 import { EPIC_END } from './EPIC_END';
 
 const defaultAdapter = {
@@ -21,6 +22,7 @@ export function createEpicMiddleware(rootEpic, options = defaultOptions) {
   // even though we used default param, we need to merge the defaults
   // inside the options object as well in case they declare only some
   options = { ...defaultOptions, ...options };
+
   const input$ = new Subject();
   const action$ = options.adapter.input(
     new ActionsObservable(input$)
@@ -29,22 +31,15 @@ export function createEpicMiddleware(rootEpic, options = defaultOptions) {
   let store;
 
   const epicMiddleware = _store => {
+    const state$ = new StateSubject(_store);
     store = _store;
 
     return next => {
       epic$
         ::map(epic => {
-          const vault = (process.env.NODE_ENV === 'production') ? store : {
-            getState: store.getState,
-            dispatch: (action) => {
-              require('./utils/console').deprecate('calling store.dispatch() directly in your Epics is deprecated and will be removed. Instead, emit actions through the Observable your Epic returns.\n\n  https://goo.gl/WWNYSP');
-              return store.dispatch(action);
-            }
-          };
-
           const output$ = ('dependencies' in options)
-            ? epic(action$, vault, options.dependencies)
-            : epic(action$, vault);
+            ? epic(action$, state$, options.dependencies)
+            : epic(action$, state$);
 
           if (!output$) {
             throw new TypeError(`Your root Epic "${epic.name || '<anonymous>'}" does not return a stream. Double check you\'re not missing a return statement!`);
@@ -53,20 +48,23 @@ export function createEpicMiddleware(rootEpic, options = defaultOptions) {
           return output$;
         })
         ::switchMap(output$ => options.adapter.output(output$))
-        .subscribe(action => {
-          try {
-            store.dispatch(action);
-          } catch (err) {
-            console.error(err);
-          }
-        });
+        .subscribe(store.dispatch);
 
-      // Setup initial root epic
+      // Setup initial root epic. It's done this way so that
+      // it's possible for them to call replaceEpic later
       epic$.next(rootEpic);
 
       return action => {
+        // Downstream middleware gets the action first,
+        // which includes their reducers, so state is
+        // updated before epics receive the action
         const result = next(action);
+
+        // It's important to update the state$ before we emit
+        // the action because otherwise it would be stale!
+        state$.next(store.getState());
         input$.next(action);
+
         return result;
       };
     };
